@@ -1,0 +1,163 @@
+name: Construction et publication
+
+# Le code de LMU Assistant est dans le dépôt privé Lipstone/lmu-assistant, où les minutes Actions sont limitées
+# (Windows compte double ; épuisées le 21/11/2026). Sur ce dépôt public elles sont gratuites : ce workflow regarde
+# toutes les 15 minutes si main a une nouvelle version, et alors la récupère, la teste, construit l'exe et
+# l'installateur, et publie la release v<version> ici, où l'appli la lit (Réglages → Mises à jour).
+#
+# Secret SOURCE_TOKEN (Settings → Secrets and variables → Actions) : jeton fine-grained limité à lmu-assistant,
+# permission « Contents : Read-only ». Le code n'est jamais copié dans ce dépôt, mais les journaux de construction
+# sont publics. Les étapes sont dans le dépôt privé : .github/actions/test et .github/actions/build-exe.
+#
+# Une version déjà tentée n'est pas reconstruite toute seule (même en échec, pour ne pas boucler) : après une
+# correction, une nouvelle fusion sur main donne une nouvelle version ; sinon Actions → « Construction et
+# publication » → Run workflow relance celle de main.
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: construction
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: Lipstone/lmu-assistant
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      sha: ${{ steps.check.outputs.sha }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Secret SOURCE_TOKEN présent
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::Secret SOURCE_TOKEN absent : jeton fine-grained limité à $SOURCE_REPO, Contents : Read-only"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          ref: main
+          fetch-depth: 0  # le numéro de version compte les fusions sur main
+          persist-credentials: false
+      - name: Version de main et release existante
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 packaging/version.py)
+          sha=$(git rev-parse HEAD)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "v$version ($sha) déjà publiée."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Marque « déjà tentée » dans le cache Actions, pour qu'un échec ne relance pas la construction toutes les 15 min.
+      - name: Déjà tentée ?
+        id: tried
+        if: steps.version.outputs.released == 'false' && github.event_name == 'schedule'
+        uses: actions/cache/restore@v4
+        with:
+          path: .tentative
+          key: tentative-${{ steps.version.outputs.sha }}
+          lookup-only: true
+      - name: Décision
+        id: check
+        env:
+          RELEASED: ${{ steps.version.outputs.released }}
+          TRIED: ${{ steps.tried.outputs.cache-hit }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$RELEASED" = "true" ]; then build=false
+          elif [ "$TRIED" = "true" ]; then build=false; echo "::warning::v$VERSION déjà tentée sans succès : Run workflow pour relancer."
+          else build=true; echo "Construction de v$VERSION ($SHA)."
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          mkdir -p .tentative && echo "$SHA" > .tentative/sha
+      - name: Marque la tentative
+        if: steps.check.outputs.build == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .tentative
+          key: tentative-${{ steps.version.outputs.sha }}
+
+  test:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/test
+
+  build:
+    needs: [check, test]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: build
+        uses: ./.github/actions/build-exe
+      - name: Même version que prévu
+        shell: pwsh
+        env:
+          EXPECTED: ${{ needs.check.outputs.version }}
+          BUILT: ${{ steps.build.outputs.version }}
+        run: if ($env:BUILT -ne $env:EXPECTED) { throw "Version construite $env:BUILT au lieu de $env:EXPECTED" }
+      # Artefact gratuit sur un dépôt public ; gardé 1 jour, le temps du job release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe
+          path: |
+            dist/LMU-Assistant.exe
+            dist/LMU-Assistant-Setup.exe
+          retention-days: 1
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: exe
+          path: dist
+      - name: Publie la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          # Notes : message du commit fusionné sur main (titre de la PR)
+          notes=$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/commits/$SHA" --jq .commit.message)
+          gh release create "v$VERSION" dist/LMU-Assistant-Setup.exe dist/LMU-Assistant.exe \
+            --repo "$GITHUB_REPOSITORY" --title "LMU Assistant $VERSION" --notes "$notes"
